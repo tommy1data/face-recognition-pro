@@ -8,6 +8,13 @@
 <link href="https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@400,500,700,800&f[]=satoshi@400,500,700&display=swap" rel="stylesheet"/>
 <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
+<script type="module">
+import vision from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3';
+const { FaceLandmarker: MPFaceLandmarker, FilesetResolver } = vision;
+window._MPFaceLandmarker = MPFaceLandmarker;
+window._FilesetResolver = FilesetResolver;
+</script>
 <style>
 /* ═══════════════════════════════════════════════════
    THEME
@@ -707,6 +714,18 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.2);}
       </div>
       Expression + age/gender model
     </div>
+    <div class="loading-step" id="step-arc">
+      <div class="loading-step-icon">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="8" stroke="currentColor" stroke-width="1.5"/></svg>
+      </div>
+      ArcFace ONNX embeddings
+    </div>
+    <div class="loading-step" id="step-mp">
+      <div class="loading-step-icon">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="8" stroke="currentColor" stroke-width="1.5"/></svg>
+      </div>
+      MediaPipe Face Mesh
+    </div>
     <div class="loading-step" id="step-done">
       <div class="loading-step-icon">
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="8" stroke="currentColor" stroke-width="1.5"/></svg>
@@ -735,11 +754,12 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.2);}
       </svg>
       <div>
         <div class="logo-name">Face Recognition Pro</div>
-        <div class="logo-sub">100% Browser · No Servers · Face-API.js + SSD MobileNet</div>
+        <div class="logo-sub">100% Browser · No Servers · ArcFace + MediaPipe</div>
       </div>
     </a>
     <div class="header-status">
       <span class="fps-badge" id="fps-badge">0 FPS</span>
+      <span id="engine-badge" style="display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:100px;padding:4px 10px;font-size:0.68rem;font-weight:700;letter-spacing:0.04em;color:var(--text-muted);transition:all 0.4s;">face-api + Eye Ratio</span>
       <div class="status-pill" id="status-pill">
         <span class="status-dot"></span>
         <span id="status-text">Loading…</span>
@@ -954,7 +974,7 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.2);}
             <div class="metric-key">Pose</div>
           </div>
         </div>
-        <div class="info-box" style="font-size:0.68rem;">Eye% = openness relative to your personal baseline. Drops to ~0% when blinking. 1 blink confirms liveness.</div>
+        <div class="info-box" style="font-size:0.68rem;">Eye% = blink intensity (MediaPipe). Spikes toward 100% when blinking. 1 blink confirms liveness.</div>
       </div>
     </div>
 
@@ -1021,7 +1041,7 @@ const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
 let modelsLoaded = false;
 let cameraRunning = false;
 let animFrame = null;
-let knownFaces = [];       // { name, descriptors[], thumb }
+let knownFaces = [];       // { name, descriptors[], arcDescriptors[], thumb }
 let captureBuffer = [];    // pending samples for registration
 let lastResult = null;
 let overlaySettings = { box: true, landmarks: true, label: true, mesh: false };
@@ -1038,6 +1058,16 @@ let lastFrameTime = 0;
 let qualityScore = 0;
 let activeMatchIndex = -1;
 
+// ── ArcFace ONNX ─────────────────────────────────────────
+let arcSession = null;   // ONNX session
+let arcReady = false;    // true once model loaded
+let useArcFace = true;   // toggle — falls back to face-api if false or model fails
+
+// ── MediaPipe FaceLandmarker ──────────────────────────────
+let mpLandmarker = null;  // MediaPipe FaceLandmarker
+let mpReady = false;
+let lastMpTime = -1;
+
 // ── Age/gender cache (re-run only on new face) ────────────
 let cachedAgeGender = {};   // key: face-slot-idx → { age, gender, box }
 const AGE_REFRESH_PX = 40; // re-run if face centroid moved > this many px
@@ -1052,6 +1082,7 @@ function saveDB() {
     const data = knownFaces.map(f => ({
       name: f.name,
       descriptors: f.descriptors.map(d => Array.from(d)),
+      arcDescriptors: f.arcDescriptors ? f.arcDescriptors.map(d => Array.from(d)) : [],
       thumb: f.thumb,
     }));
     localStorage.setItem('frp_db', JSON.stringify(data));
@@ -1066,6 +1097,7 @@ function loadDB() {
     knownFaces = data.map(f => ({
       name: f.name,
       descriptors: f.descriptors.map(d => new Float32Array(d)),
+      arcDescriptors: f.arcDescriptors ? f.arcDescriptors.map(d => new Float32Array(d)) : [],
       thumb: f.thumb || null,
     }));
     renderGallery();
@@ -1127,9 +1159,55 @@ async function loadModels() {
   await faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL);
   stepDone('step-exp');
 
+  // Load ArcFace ONNX model
+  stepActive('step-arc');
+  try {
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
+    arcSession = await ort.InferenceSession.create(
+      'https://huggingface.co/garavv/arcface-onnx/resolve/main/arc.onnx',
+      { executionProviders: ['wasm'] }
+    );
+    arcReady = true;
+  } catch(e) {
+    console.warn('ArcFace ONNX load failed, falling back to face-api:', e);
+    arcReady = false;
+  }
+  stepDone('step-arc');
+
+  // Load MediaPipe FaceLandmarker
+  stepActive('step-mp');
+  try {
+    let attempts = 0;
+    while (!window._FilesetResolver && attempts++ < 20) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (window._FilesetResolver) {
+      const filesetResolver = await window._FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
+      );
+      mpLandmarker = await window._MPFaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        outputFaceBlendshapes: true,
+        runningMode: 'VIDEO',
+        numFaces: 4
+      });
+      mpReady = true;
+    }
+  } catch(e) {
+    console.warn('MediaPipe FaceLandmarker failed:', e);
+    mpReady = false;
+  }
+  stepDone('step-mp');
+
   stepActive('step-done');
   modelsLoaded = true;
   stepDone('step-done');
+
+  // Update engine badge
+  updateEngineIndicator();
 
   // Hide overlay
   const overlay = document.getElementById('loading-overlay');
@@ -1264,6 +1342,84 @@ function getAlignedFaceCanvas(landmarks, videoEl) {
   tc.drawImage(videoEl, -(cx - faceSize / 2) * 160 / faceSize, -(cy - faceSize / 2) * 160 / faceSize,
     videoEl.videoWidth * 160 / faceSize, videoEl.videoHeight * 160 / faceSize);
   return tmp;
+}
+
+// ── ArcFace embedding ────────────────────────────────────────
+async function getArcFaceEmbedding(alignedCanvas) {
+  if (!arcSession || !arcReady) return null;
+  // Resize to 112x112
+  const tmp = document.createElement('canvas');
+  tmp.width = tmp.height = 112;
+  tmp.getContext('2d').drawImage(alignedCanvas, 0, 0, 112, 112);
+  const ctx112 = tmp.getContext('2d');
+  const imgData = ctx112.getImageData(0, 0, 112, 112);
+  const data = imgData.data;
+  // NCHW: channels first, normalize (px - 127.5) / 128
+  const float32 = new Float32Array(3 * 112 * 112);
+  for (let i = 0; i < 112 * 112; i++) {
+    float32[i]             = (data[i*4]   - 127.5) / 128.0; // R
+    float32[i + 112*112]   = (data[i*4+1] - 127.5) / 128.0; // G
+    float32[i + 2*112*112] = (data[i*4+2] - 127.5) / 128.0; // B
+  }
+  const tensor = new ort.Tensor('float32', float32, [1, 3, 112, 112]);
+  const feeds = { [arcSession.inputNames[0]]: tensor };
+  const result = await arcSession.run(feeds);
+  const raw = result[arcSession.outputNames[0]].data;
+  // L2 normalize
+  let norm = 0;
+  for (let v of raw) norm += v * v;
+  norm = Math.sqrt(norm);
+  return norm > 0 ? new Float32Array(raw).map(v => v / norm) : new Float32Array(raw);
+}
+
+// ── ArcFace cosine matching ─────────────────────────────────
+function cosineSim(a, b) {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot; // both are L2-normalized, so this is cosine similarity
+}
+
+function arcFaceMatch(queryEmb) {
+  // Returns {label, distance, confidence} or null
+  if (!arcReady || knownFaces.length === 0 || !queryEmb) return null;
+  let best = null, bestSim = -1;
+  for (const face of knownFaces) {
+    for (const emb of face.arcDescriptors || []) {
+      const sim = cosineSim(queryEmb, emb);
+      if (sim > bestSim) { bestSim = sim; best = face.name; }
+    }
+  }
+  // ArcFace threshold: sim > 0.35 = match (cosine)
+  const ARC_THRESH = 0.35;
+  if (best && bestSim > ARC_THRESH) {
+    const confidence = Math.max(0, Math.min(1, (bestSim - ARC_THRESH) / (1.0 - ARC_THRESH)));
+    return { label: best, distance: 1 - bestSim, confidence };
+  }
+  return { label: 'unknown', distance: 1 - bestSim, confidence: 0 };
+}
+
+// ── Engine indicator ─────────────────────────────────────────
+function updateEngineIndicator() {
+  const badge = document.getElementById('engine-badge');
+  if (!badge) return;
+  let label, color, bg, border;
+  if (arcReady && mpReady) {
+    label = 'ArcFace + MediaPipe';
+    color = '#34d399'; bg = 'rgba(52,211,153,0.12)'; border = 'rgba(52,211,153,0.4)';
+  } else if (arcReady && !mpReady) {
+    label = 'ArcFace + Eye Ratio';
+    color = '#38bdf8'; bg = 'rgba(56,189,248,0.1)'; border = 'rgba(56,189,248,0.3)';
+  } else if (!arcReady && mpReady) {
+    label = 'face-api + MediaPipe';
+    color = '#fbbf24'; bg = 'rgba(251,191,36,0.1)'; border = 'rgba(251,191,36,0.3)';
+  } else {
+    label = 'face-api + Eye Ratio';
+    color = 'var(--text-muted)'; bg = 'var(--surface2)'; border = 'var(--border)';
+  }
+  badge.textContent = label;
+  badge.style.color = color;
+  badge.style.background = bg;
+  badge.style.borderColor = border;
 }
 
 // ── Matching ──────────────────────────────────────────────
@@ -1475,6 +1631,55 @@ async function runLoop() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   if (video.readyState >= 2) {
+    // MediaPipe liveness detection (blendshapes) — runs BEFORE faceapi loop
+    let mpBlinkLeft = 0, mpBlinkRight = 0;
+    if (mpReady && featureSettings.liveness && video.readyState >= 2) {
+      try {
+        const now2 = performance.now();
+        if (lastMpTime !== video.currentTime) {
+          lastMpTime = video.currentTime;
+          const mpResult = mpLandmarker.detectForVideo(video, now2);
+          if (mpResult.faceBlendshapes && mpResult.faceBlendshapes.length > 0) {
+            const shapes = mpResult.faceBlendshapes[0].categories;
+            const leftBlink  = shapes.find(s => s.categoryName === 'eyeBlinkLeft');
+            const rightBlink = shapes.find(s => s.categoryName === 'eyeBlinkRight');
+            mpBlinkLeft  = leftBlink  ? leftBlink.score  : 0;
+            mpBlinkRight = rightBlink ? rightBlink.score : 0;
+            const avgBlink = (mpBlinkLeft + mpBlinkRight) / 2;
+
+            // Blink state machine with MediaPipe scores
+            const BLINK_CLOSED = 0.4;
+            const BLINK_OPEN   = 0.15;
+            const nowClosed = avgBlink > BLINK_CLOSED;
+            const nowOpen   = avgBlink < BLINK_OPEN;
+
+            if (!window._mpWasClosed && nowClosed) {
+              window._mpBlinkStart = Date.now();
+              window._mpWasClosed = true;
+            }
+            if (window._mpWasClosed && nowOpen && window._mpBlinkStart) {
+              const dur = Date.now() - window._mpBlinkStart;
+              if (dur >= 50 && dur <= 700) {
+                blinkCount++;
+                blinkTimestamps.push(Date.now());
+                blinkTimestamps = blinkTimestamps.filter(t => Date.now() - t < 10000);
+              }
+              window._mpWasClosed = false;
+              window._mpBlinkStart = null;
+            }
+            // Timeout — closed too long
+            if (window._mpBlinkStart && Date.now() - window._mpBlinkStart > 700) {
+              window._mpWasClosed = false;
+              window._mpBlinkStart = null;
+            }
+
+            // Update EAR display to show blink score
+            document.getElementById('live-ear').textContent = (avgBlink * 100).toFixed(0) + '%';
+          }
+        }
+      } catch(e) { /* ignore frame errors */ }
+    }
+
     const options = new faceapi.SsdMobilenetv1Options({ minConfidence });
 
     // Detect faces — age/gender only when face is new/moved (cached otherwise)
@@ -1534,7 +1739,8 @@ async function runLoop() {
     let bestConfidence = 0;
     const allHudInfos = [];   // collect per-face HUD data
 
-    detections.forEach((det, idx) => {
+    for (let idx = 0; idx < detections.length; idx++) {
+      const det = detections[idx];
       // Quality
       const q = computeQuality(det, null);
 
@@ -1542,53 +1748,48 @@ async function runLoop() {
       drawLandmarks(det.landmarks);
       drawMesh(det.landmarks);
 
-      // Liveness — eye openness ratio with adaptive baseline
+      // Liveness — use MediaPipe blendshapes if available, else adaptive EAR fallback
       if (featureSettings.liveness) {
-        const allPts = det.landmarks.positions;
-        const openness = eyeOpenness(allPts);
+        if (!mpReady) {
+          // Fallback: adaptive EAR baseline from face-api landmarks
+          const allPts = det.landmarks.positions;
+          const openness = eyeOpenness(allPts);
 
-        // Adaptive baseline: learn the person's open-eye level over first 30 frames
-        earHistory.push(openness);
-        if (earHistory.length > 30) earHistory.shift();
+          earHistory.push(openness);
+          if (earHistory.length > 30) earHistory.shift();
 
-        // Baseline = 90th percentile of recent history (their normal open-eye value)
-        const sorted = [...earHistory].sort((a, b) => a - b);
-        const baseline = sorted[Math.floor(sorted.length * 0.9)] || 0.30;
-        // Closed threshold = 65% of their own baseline (person-specific)
-        const closedThresh = baseline * 0.65;
-        // Open threshold = 80% of baseline (must return above this to complete blink)
-        const openThresh = baseline * 0.80;
+          const sorted = [...earHistory].sort((a, b) => a - b);
+          const baseline = sorted[Math.floor(sorted.length * 0.9)] || 0.30;
+          const closedThresh = baseline * 0.65;
+          const openThresh = baseline * 0.80;
 
-        // State machine: track open→closed→open transitions
-        const wasClosed = lastEAR < closedThresh;
-        const nowClosed = openness < closedThresh;
-        const wasOpen   = lastEAR >= openThresh;
+          const wasClosed = lastEAR < closedThresh;
+          const nowClosed = openness < closedThresh;
+          const wasOpen   = lastEAR >= openThresh;
 
-        if (wasOpen && nowClosed) {
-          // Eye just closed — start timing
-          if (!window._blinkStart) window._blinkStart = Date.now();
-        }
-        if (wasClosed && openness >= openThresh && window._blinkStart) {
-          // Eye reopened — count as blink if duration 60–600ms (real blink window)
-          const dur = Date.now() - window._blinkStart;
-          if (dur >= 60 && dur <= 600) {
-            blinkCount++;
-            blinkTimestamps.push(Date.now());
-            blinkTimestamps = blinkTimestamps.filter(t => Date.now() - t < 10000);
+          if (wasOpen && nowClosed) {
+            if (!window._blinkStart) window._blinkStart = Date.now();
           }
-          window._blinkStart = null;
-        }
-        // Abandon if eye closed too long (> 600ms = not a blink)
-        if (window._blinkStart && Date.now() - window._blinkStart > 600) {
-          window._blinkStart = null;
-        }
+          if (wasClosed && openness >= openThresh && window._blinkStart) {
+            const dur = Date.now() - window._blinkStart;
+            if (dur >= 60 && dur <= 600) {
+              blinkCount++;
+              blinkTimestamps.push(Date.now());
+              blinkTimestamps = blinkTimestamps.filter(t => Date.now() - t < 10000);
+            }
+            window._blinkStart = null;
+          }
+          if (window._blinkStart && Date.now() - window._blinkStart > 600) {
+            window._blinkStart = null;
+          }
 
-        lastEAR = openness;
+          lastEAR = openness;
+          document.getElementById('live-ear').textContent =
+            baseline > 0 ? (openness / baseline * 100).toFixed(0) + '%' : openness.toFixed(2);
+        }
+        // (MediaPipe blendshape blink logic runs above in the mp block)
 
         document.getElementById('live-blinks').textContent = blinkCount;
-        // Show openness % of baseline so user can see the number responding
-        document.getElementById('live-ear').textContent =
-          baseline > 0 ? (openness / baseline * 100).toFixed(0) + '%' : openness.toFixed(2);
 
         const isLive = blinkTimestamps.length >= 1;  // 1 confirmed blink = live
         const dot = document.getElementById('live-dot');
@@ -1623,7 +1824,7 @@ async function runLoop() {
       }
 
       // ─ Liveness state ─
-      const isLive = blinkTimestamps.length >= 2;
+      const isLive = blinkTimestamps.length >= 1;
 
       // ─ Match ─
       let matchResult = null;
@@ -1631,12 +1832,32 @@ async function runLoop() {
       let color = '#f87171';
       let label = 'Unknown';
 
-      if (matcher) {
+      if (arcReady && knownFaces.length > 0) {
+        // ArcFace path: compute embedding and cosine match
+        const aligned = getAlignedFaceCanvas(det.landmarks, video);
+        const arcEmb = await getArcFaceEmbedding(aligned);
+        const arcResult = arcFaceMatch(arcEmb);
+        if (arcResult && arcResult.label !== 'unknown') {
+          matchResult = arcResult;
+          confidence = arcResult.confidence;
+          color = '#34d399';
+          label = arcResult.label;
+          if (confidence > bestConfidence) {
+            bestConfidence = confidence;
+            bestMatch = { matchResult, det, confidence, color };
+          }
+        } else {
+          label = 'Unknown';
+          confidence = det.detection.score * 0.4;
+          if (arcResult) matchResult = arcResult;
+        }
+      } else if (matcher) {
+        // face-api fallback
         matchResult = matcher.findBestMatch(det.descriptor);
         if (matchResult.label !== 'unknown') {
           confidence = Math.max(0, Math.min(1, 1 - matchResult.distance / matchThreshold));
           color = '#34d399';
-          label = matchResult.label;   // name only — age/gender go in HUD card
+          label = matchResult.label;
           if (confidence > bestConfidence) {
             bestConfidence = confidence;
             bestMatch = { matchResult, det, confidence, color };
@@ -1663,7 +1884,7 @@ async function runLoop() {
 
       if (overlaySettings.box) drawBox(det.detection, label, color, confidence, hudInfo);
       allHudInfos.push(hudInfo);
-    });
+    } // end for...of detections
 
     // Update HTML HUD cards
     updateHUDLayer(allHudInfos);
@@ -1834,6 +2055,16 @@ async function captureSample() {
 
   captureBuffer.push(det.descriptor);
 
+  // Also compute ArcFace embedding for this sample
+  if (arcReady) {
+    const aligned = getAlignedFaceCanvas(det.landmarks, video);
+    const arcEmb = await getArcFaceEmbedding(aligned);
+    if (arcEmb) {
+      if (!captureBuffer._arcEmbs) captureBuffer._arcEmbs = [];
+      captureBuffer._arcEmbs.push(arcEmb);
+    }
+  }
+
   // Grab thumbnail on first sample
   let thumb = null;
   if (captureBuffer.length === 1) {
@@ -1869,11 +2100,16 @@ function registerFace() {
     existing.descriptors.push(...captureBuffer);
     // Keep max 10 descriptors per person
     if (existing.descriptors.length > 10) existing.descriptors = existing.descriptors.slice(-10);
+    // Merge ArcFace embeddings
+    if (!existing.arcDescriptors) existing.arcDescriptors = [];
+    existing.arcDescriptors.push(...(captureBuffer._arcEmbs || []));
+    if (existing.arcDescriptors.length > 10) existing.arcDescriptors = existing.arcDescriptors.slice(-10);
     toast(`Updated "${name}" with ${captureBuffer.length} more samples`, 'success');
   } else {
     knownFaces.push({
       name,
       descriptors: [...captureBuffer],
+      arcDescriptors: captureBuffer._arcEmbs || [],
       thumb: captureBuffer._thumb || null,
     });
     toast(`"${name}" registered with ${captureBuffer.length} samples`, 'success');
@@ -1881,6 +2117,7 @@ function registerFace() {
 
   captureBuffer = [];
   captureBuffer._thumb = null;
+  captureBuffer._arcEmbs = null;
   document.getElementById('cap-fill').style.width = '0%';
   document.getElementById('cap-text').textContent = '0 / 5 samples captured';
   document.getElementById('reg-btn').disabled = true;
@@ -1920,6 +2157,7 @@ function exportDB() {
   const data = JSON.stringify(knownFaces.map(f => ({
     name: f.name,
     descriptors: f.descriptors.map(d => Array.from(d)),
+    arcDescriptors: f.arcDescriptors ? f.arcDescriptors.map(d => Array.from(d)) : [],
     thumb: f.thumb,
   })), null, 2);
   const blob = new Blob([data], { type: 'application/json' });
@@ -1940,6 +2178,7 @@ function importDB(file) {
       const imported = data.map(f => ({
         name: f.name,
         descriptors: f.descriptors.map(d => new Float32Array(d)),
+        arcDescriptors: f.arcDescriptors ? f.arcDescriptors.map(d => new Float32Array(d)) : [],
         thumb: f.thumb || null,
       }));
       knownFaces = [...knownFaces, ...imported];
