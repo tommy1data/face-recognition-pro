@@ -977,6 +977,10 @@ let lastFrameTime = 0;
 let qualityScore = 0;
 let activeMatchIndex = -1;
 
+// ── Age/gender cache (re-run only on new face) ────────────
+let cachedAgeGender = {};   // key: face-slot-idx → { age, gender, box }
+const AGE_REFRESH_PX = 40; // re-run if face centroid moved > this many px
+
 // ── Storage helpers ──────────────────────────────────────
 function canStore() {
   try { localStorage.setItem('_t','1'); localStorage.removeItem('_t'); return true; } catch(e) { return false; }
@@ -1112,6 +1116,7 @@ async function startCamera() {
 
 function stopCamera() {
   cameraRunning = false;
+  cachedAgeGender = {};   // clear age/gender cache on stop
   cancelAnimationFrame(animFrame);
   const stream = video.srcObject;
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -1197,11 +1202,13 @@ function buildMatcher() {
 }
 
 // ── Draw overlay ──────────────────────────────────────────
-function drawBox(det, label, color, confidence) {
+// ── On-canvas HUD card drawn below each detected face ─────────
+// Draws: bounding box + corner accents + floating info card
+function drawBox(det, label, color, confidence, extraInfo) {
   const { x, y, width, height } = det.box;
   const r = 6;
 
-  // Box
+  // ─ Rounded bounding box ─
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -1217,14 +1224,13 @@ function drawBox(det, label, color, confidence) {
   ctx.closePath();
   ctx.stroke();
 
-  // Corner accents
+  // ─ Corner accent marks ─
   ctx.lineWidth = 3;
-  const clen = 14;
-  const corners = [
+  const clen = 16;
+  [
     [x, y, 1, 1], [x + width, y, -1, 1],
     [x, y + height, 1, -1], [x + width, y + height, -1, -1],
-  ];
-  corners.forEach(([cx2, cy2, sx, sy]) => {
+  ].forEach(([cx2, cy2, sx, sy]) => {
     ctx.beginPath();
     ctx.moveTo(cx2, cy2 + sy * clen);
     ctx.lineTo(cx2, cy2);
@@ -1232,25 +1238,93 @@ function drawBox(det, label, color, confidence) {
     ctx.stroke();
   });
 
-  if (!overlaySettings.label || !label) return;
-  // Label pill
-  ctx.font = 'bold 12px Satoshi, sans-serif';
-  const tw = ctx.measureText(label).width;
-  const ph = 20, pw = tw + 16;
-  ctx.fillStyle = color;
-  const lx = x, ly = y - ph - 2;
-  ctx.beginPath();
-  ctx.roundRect(lx, ly, pw, ph, 4);
-  ctx.fill();
-  ctx.fillStyle = '#fff';
-  ctx.fillText(label, lx + 8, ly + 14);
+  if (!overlaySettings.label) return;
 
-  // Confidence bar below label
-  const bw = Math.max(pw, 60);
-  ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  ctx.fillRect(lx, ly + ph + 2, bw, 4);
+  // ─ HUD info card ─
+  // Layout: name row | row2 (age · gender) | emotion row | conf bar
+  const { emotion, age, gender, isLive, livenessChecking } = extraInfo || {};
+  const cardPad = 10;
+  const lineH  = 17;
+  const rows   = [label];
+  if (age !== undefined && gender) rows.push(`${Math.round(age)} yrs  ·  ${gender}`);
+  if (emotion)                     rows.push(emotion);
+  const cardH = cardPad * 2 + rows.length * lineH + (confidence !== null ? 8 : 0);
+
+  // Measure widest row
+  ctx.font = 'bold 13px Satoshi, Inter, sans-serif';
+  let maxW = 120;
+  rows.forEach(r => { const w = ctx.measureText(r).width; if (w > maxW) maxW = w; });
+  const cardW = maxW + cardPad * 2 + (livenessChecking ? 14 : 0);
+
+  // Position: below face box, clamped inside canvas
+  let cx2 = x;
+  let cy2 = y + height + 8;
+  if (cx2 + cardW > canvas.width - 4)  cx2 = canvas.width - cardW - 4;
+  if (cx2 < 4)                          cx2 = 4;
+  if (cy2 + cardH > canvas.height - 4)  cy2 = y - cardH - 8; // flip above
+
+  // Card background
+  ctx.save();
+  ctx.globalAlpha = 0.82;
+  ctx.fillStyle = '#050816';
+  ctx.beginPath();
+  ctx.roundRect(cx2, cy2, cardW, cardH, 7);
+  ctx.fill();
+  // Card border in face color
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.roundRect(cx2, cy2, cardW, cardH, 7);
+  ctx.stroke();
+  ctx.restore();
+
+  // ─ Row 0: name (colored) + optional liveness dot ─
+  let ty = cy2 + cardPad + 12;
+  ctx.font = 'bold 13px Satoshi, Inter, sans-serif';
   ctx.fillStyle = color;
-  ctx.fillRect(lx, ly + ph + 2, bw * confidence, 4);
+  ctx.fillText(rows[0], cx2 + cardPad, ty);
+
+  // Liveness dot on the right side of name row
+  if (livenessChecking !== undefined) {
+    const dotR = 5;
+    const dotX = cx2 + cardW - cardPad - dotR;
+    const dotY = ty - dotR;
+    ctx.fillStyle = isLive ? '#34d399' : '#fbbf24';
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, dotR, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ─ Row 1: age · gender ─
+  if (rows.length > 1) {
+    ty += lineH;
+    ctx.font = '12px Satoshi, Inter, sans-serif';
+    ctx.fillStyle = 'rgba(226,232,240,0.75)';
+    ctx.fillText(rows[1], cx2 + cardPad, ty);
+  }
+
+  // ─ Row 2: dominant emotion ─
+  if (rows.length > 2) {
+    ty += lineH;
+    ctx.font = '12px Satoshi, Inter, sans-serif';
+    ctx.fillStyle = 'rgba(129,140,248,0.9)';
+    ctx.fillText(rows[2], cx2 + cardPad, ty);
+  }
+
+  // ─ Confidence bar at card bottom ─
+  if (confidence !== null) {
+    const barY  = cy2 + cardH - cardPad - 4;
+    const barW  = cardW - cardPad * 2;
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.beginPath();
+    ctx.roundRect(cx2 + cardPad, barY, barW, 4, 2);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.roundRect(cx2 + cardPad, barY, barW * Math.max(0, Math.min(1, confidence)), 4, 2);
+    ctx.fill();
+  }
 }
 
 function drawLandmarks(landmarks) {
@@ -1313,13 +1387,55 @@ async function runLoop() {
   if (video.readyState >= 2) {
     const options = new faceapi.SsdMobilenetv1Options({ minConfidence });
 
-    // Detect all faces with landmarks + descriptors + expressions + age/gender
+    // Detect faces — age/gender only when face is new/moved (cached otherwise)
     const detections = await faceapi
       .detectAllFaces(video, options)
       .withFaceLandmarks()
       .withFaceDescriptors()
-      .withFaceExpressions()
-      .withAgeAndGender();
+      .withFaceExpressions();
+
+    // Age/gender: run only when centroid has moved significantly
+    if (featureSettings['age-gender'] && detections.length > 0) {
+      const ageJobs = [];
+      detections.forEach((det, i) => {
+        const b = det.detection.box;
+        const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+        const cached = cachedAgeGender[i];
+        const moved = !cached ||
+          Math.hypot(cx - cached.cx, cy - cached.cy) > AGE_REFRESH_PX ||
+          Math.abs(b.width - cached.w) > AGE_REFRESH_PX;
+        if (moved) ageJobs.push(i);
+      });
+      if (ageJobs.length > 0) {
+        // Run withAgeAndGender only on faces that need a refresh
+        const withAG = await faceapi
+          .detectAllFaces(video, options)
+          .withFaceLandmarks()
+          .withAgeAndGender();
+        ageJobs.forEach(i => {
+          if (withAG[i]) {
+            const b = detections[i].detection.box;
+            cachedAgeGender[i] = {
+              age: withAG[i].age,
+              gender: withAG[i].gender,
+              genderProb: withAG[i].genderProbability,
+              cx: b.x + b.width / 2,
+              cy: b.y + b.height / 2,
+              w: b.width,
+            };
+          }
+        });
+      }
+      // Attach cached values back onto detections
+      detections.forEach((det, i) => {
+        const c = cachedAgeGender[i];
+        if (c) { det.age = c.age; det.gender = c.gender; det.genderProbability = c.genderProb; }
+      });
+    } else if (!featureSettings['age-gender']) {
+      cachedAgeGender = {};
+    }
+    // Purge stale slots if fewer faces than before
+    Object.keys(cachedAgeGender).forEach(k => { if (+k >= detections.length) delete cachedAgeGender[+k]; });
 
     const matcher = buildMatcher();
 
@@ -1381,7 +1497,19 @@ async function runLoop() {
       const yawDeg = Math.round(Math.abs(noseTip.x - faceCenter.x) / (pts[16].x - pts[0].x) * 60);
       document.getElementById('live-pose').textContent = yawDeg > 5 ? `${yawSign}${yawDeg}°` : 'Fwd';
 
-      // Match
+      // ─ Dominant emotion for HUD ─
+      let dominantEmotion = null;
+      if (featureSettings.emotions && det.expressions) {
+        const emoMap = { happy:'Happy 😄', neutral:'Neutral 😐', sad:'Sad 😢', angry:'Angry 😠',
+                         surprised:'Surprised 😲', disgusted:'Disgusted 🤢', fearful:'Fearful 😨' };
+        const top = Object.entries(det.expressions).sort((a,b) => b[1]-a[1])[0];
+        if (top && top[1] > 0.3) dominantEmotion = emoMap[top[0]] || top[0];
+      }
+
+      // ─ Liveness state ─
+      const isLive = blinkTimestamps.length >= 2;
+
+      // ─ Match ─
       let matchResult = null;
       let confidence = 0;
       let color = '#f87171';
@@ -1390,13 +1518,9 @@ async function runLoop() {
       if (matcher) {
         matchResult = matcher.findBestMatch(det.descriptor);
         if (matchResult.label !== 'unknown') {
-          // distance 0 = perfect, threshold = no match. Confidence = 1 - (dist/threshold)
           confidence = Math.max(0, Math.min(1, 1 - matchResult.distance / matchThreshold));
           color = '#34d399';
-          const ageStr = featureSettings['age-gender'] ? ` · ${Math.round(det.age)}y` : '';
-          const genderStr = featureSettings['age-gender'] ? ` · ${det.gender}` : '';
-          label = `${matchResult.label}${ageStr}${genderStr}`;
-
+          label = matchResult.label;   // name only — age/gender go in HUD card
           if (confidence > bestConfidence) {
             bestConfidence = confidence;
             bestMatch = { matchResult, det, confidence, color };
@@ -1406,16 +1530,22 @@ async function runLoop() {
           confidence = det.detection.score * 0.4;
         }
       } else {
-        // No database — just show detection info
-        const ageStr = featureSettings['age-gender'] ? ` ${Math.round(det.age)}y` : '';
-        const genderStr = featureSettings['age-gender'] ? ` ${det.gender}` : '';
-        label = `Face${ageStr}${genderStr}`;
+        label = 'Face';               // no database — name only
         color = '#38bdf8';
         confidence = det.detection.score;
         if (!bestMatch) bestMatch = { matchResult: null, det, confidence, color };
       }
 
-      if (overlaySettings.box) drawBox(det.detection, label, color, confidence);
+      // Build extraInfo for HUD card
+      const hudInfo = {
+        emotion: dominantEmotion,
+        age:    featureSettings['age-gender'] && det.age !== undefined ? det.age : undefined,
+        gender: featureSettings['age-gender'] && det.gender ? det.gender : undefined,
+        isLive,
+        livenessChecking: featureSettings.liveness ? true : undefined,
+      };
+
+      if (overlaySettings.box) drawBox(det.detection, label, color, confidence, hudInfo);
     });
 
     // Update right panel with best match
