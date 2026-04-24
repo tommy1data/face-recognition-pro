@@ -954,7 +954,7 @@ input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.2);}
             <div class="metric-key">Pose</div>
           </div>
         </div>
-        <div class="info-box" style="font-size:0.68rem;">EAR = Eye Aspect Ratio. Values &lt;0.20 indicate a blink. 2+ blinks confirm liveness.</div>
+        <div class="info-box" style="font-size:0.68rem;">Eye% = openness relative to your personal baseline. Drops to ~0% when blinking. 1 blink confirms liveness.</div>
       </div>
     </div>
 
@@ -1196,12 +1196,24 @@ function stopCamera() {
 function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
-function eyeAspectRatio(pts) {
-  // pts: 6 points of eye landmark
+// Eye openness ratio — scale-invariant, works on full 68-pt landmark array
+// Returns: ~0.28-0.45 open, <0.18 closed (varies per person)
+function eyeOpenness(allPts) {
+  // Left eye: outer corners 36,39; vertical 37/38 top, 41/40 bottom
+  const lH = (dist(allPts[37], allPts[41]) + dist(allPts[38], allPts[40])) / 2;
+  const lW = dist(allPts[36], allPts[39]);
+  // Right eye: outer corners 42,45; vertical 43/44 top, 47/46 bottom
+  const rH = (dist(allPts[43], allPts[47]) + dist(allPts[44], allPts[46])) / 2;
+  const rW = dist(allPts[42], allPts[45]);
+  const lR = lW > 1 ? lH / lW : 0;
+  const rR = rW > 1 ? rH / rW : 0;
+  return (lR + rR) / 2;
+}
+function eyeAspectRatio(pts) {  // legacy shim
   const A = dist(pts[1], pts[5]);
   const B = dist(pts[2], pts[4]);
   const C = dist(pts[0], pts[3]);
-  return (A + B) / (2.0 * C);
+  return C > 0 ? (A + B) / (2.0 * C) : 0;
 }
 
 // ── Face quality score ────────────────────────────────────
@@ -1530,33 +1542,55 @@ async function runLoop() {
       drawLandmarks(det.landmarks);
       drawMesh(det.landmarks);
 
-      // EAR for liveness
+      // Liveness — eye openness ratio with adaptive baseline
       if (featureSettings.liveness) {
-        const pts = det.landmarks.positions;
-        const leftEAR = eyeAspectRatio(pts.slice(36, 42));
-        const rightEAR = eyeAspectRatio(pts.slice(42, 48));
-        const ear = (leftEAR + rightEAR) / 2;
+        const allPts = det.landmarks.positions;
+        const openness = eyeOpenness(allPts);
 
-        // Light 2-frame smoothing only — preserve blink sharpness
-        earHistory.push(ear);
-        if (earHistory.length > 2) earHistory.shift();
-        const avgEAR = earHistory.reduce((a, b) => a + b, 0) / earHistory.length;
+        // Adaptive baseline: learn the person's open-eye level over first 30 frames
+        earHistory.push(openness);
+        if (earHistory.length > 30) earHistory.shift();
 
-        // Blink detection: looser thresholds for real-world webcams
-        // Open eye: EAR typically 0.25–0.35. Blink dips to 0.15–0.22.
-        const EAR_OPEN   = 0.23;   // was open (above this)
-        const EAR_CLOSED = 0.20;   // considered closed (below this)
-        if (lastEAR >= EAR_OPEN && avgEAR < EAR_CLOSED) {
-          blinkCount++;
-          blinkTimestamps.push(Date.now());
-          blinkTimestamps = blinkTimestamps.filter(t => Date.now() - t < 8000);
+        // Baseline = 90th percentile of recent history (their normal open-eye value)
+        const sorted = [...earHistory].sort((a, b) => a - b);
+        const baseline = sorted[Math.floor(sorted.length * 0.9)] || 0.30;
+        // Closed threshold = 65% of their own baseline (person-specific)
+        const closedThresh = baseline * 0.65;
+        // Open threshold = 80% of baseline (must return above this to complete blink)
+        const openThresh = baseline * 0.80;
+
+        // State machine: track open→closed→open transitions
+        const wasClosed = lastEAR < closedThresh;
+        const nowClosed = openness < closedThresh;
+        const wasOpen   = lastEAR >= openThresh;
+
+        if (wasOpen && nowClosed) {
+          // Eye just closed — start timing
+          if (!window._blinkStart) window._blinkStart = Date.now();
         }
-        lastEAR = avgEAR;
+        if (wasClosed && openness >= openThresh && window._blinkStart) {
+          // Eye reopened — count as blink if duration 60–600ms (real blink window)
+          const dur = Date.now() - window._blinkStart;
+          if (dur >= 60 && dur <= 600) {
+            blinkCount++;
+            blinkTimestamps.push(Date.now());
+            blinkTimestamps = blinkTimestamps.filter(t => Date.now() - t < 10000);
+          }
+          window._blinkStart = null;
+        }
+        // Abandon if eye closed too long (> 600ms = not a blink)
+        if (window._blinkStart && Date.now() - window._blinkStart > 600) {
+          window._blinkStart = null;
+        }
+
+        lastEAR = openness;
 
         document.getElementById('live-blinks').textContent = blinkCount;
-        document.getElementById('live-ear').textContent = avgEAR.toFixed(2);
+        // Show openness % of baseline so user can see the number responding
+        document.getElementById('live-ear').textContent =
+          baseline > 0 ? (openness / baseline * 100).toFixed(0) + '%' : openness.toFixed(2);
 
-        const isLive = blinkTimestamps.length >= 2;
+        const isLive = blinkTimestamps.length >= 1;  // 1 confirmed blink = live
         const dot = document.getElementById('live-dot');
         const liveStatus = document.getElementById('live-status');
         if (isLive) {
@@ -1565,10 +1599,9 @@ async function runLoop() {
           document.getElementById('challenge-badge').classList.remove('visible');
         } else {
           dot.style.background = 'var(--yellow)';
-          liveStatus.textContent = `Need ${Math.max(0, 2 - blinkTimestamps.length)} more blink(s)`;
+          liveStatus.textContent = 'Blink once to confirm';
           document.getElementById('challenge-badge').classList.add('visible');
-          document.getElementById('challenge-text').textContent =
-            blinkTimestamps.length === 0 ? 'Blink to verify liveness' : '1 more blink needed';
+          document.getElementById('challenge-text').textContent = 'Blink naturally to verify';
         }
       }
 
