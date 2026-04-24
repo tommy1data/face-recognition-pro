@@ -1540,20 +1540,30 @@ function cosineSim(a, b) {
 function arcFaceMatch(queryEmb) {
   // Returns {label, distance, confidence} or null
   if (!arcReady || knownFaces.length === 0 || !queryEmb) return null;
-  let best = null, bestSim = -1;
+  let best = null, bestSim = -1, bestFace = null;
   for (const face of knownFaces) {
-    for (const emb of face.arcDescriptors || []) {
-      const sim = cosineSim(queryEmb, emb);
-      if (sim > bestSim) { bestSim = sim; best = face.name; }
-    }
+    // Average similarity across all enrolled samples for this person
+    const embs = face.arcDescriptors || [];
+    if (embs.length === 0) continue;
+    let sumSim = 0;
+    for (const emb of embs) sumSim += cosineSim(queryEmb, emb);
+    const avgSim = sumSim / embs.length;
+    if (avgSim > bestSim) { bestSim = avgSim; best = face.name; bestFace = face; }
   }
-  // ArcFace threshold: sim > 0.35 = match (cosine)
-  const ARC_THRESH = 0.35;
+  // ArcFace threshold: real-world same-person cosine typically 0.3–0.7
+  // Threshold at 0.25 — anything above = potential match
+  const ARC_THRESH = 0.25;
+  // Map similarity to confidence:
+  //   0.25 (threshold) → 0%
+  //   0.45 (good match) → ~67%
+  //   0.65 (strong match) → ~93%
+  // Formula: use sqrt scaling so mid-range sims look reasonable
   if (best && bestSim > ARC_THRESH) {
-    const confidence = Math.max(0, Math.min(1, (bestSim - ARC_THRESH) / (1.0 - ARC_THRESH)));
-    return { label: best, distance: 1 - bestSim, confidence };
+    const raw = (bestSim - ARC_THRESH) / (0.75 - ARC_THRESH); // normalize 0.25–0.75 → 0–1
+    const confidence = Math.max(0, Math.min(1, Math.sqrt(raw)));  // sqrt curve — feels more natural
+    return { label: best, distance: 1 - bestSim, confidence, sim: bestSim };
   }
-  return { label: 'unknown', distance: 1 - bestSim, confidence: 0 };
+  return { label: 'unknown', distance: 1 - bestSim, confidence: 0, sim: bestSim };
 }
 
 // ── Engine indicator ─────────────────────────────────────────
@@ -2112,7 +2122,12 @@ function updateResultPanel(best, det) {
   const conf = best.confidence;
   confFill.style.width = `${conf * 100}%`;
   confPct.textContent = `${(conf * 100).toFixed(0)}%`;
-  mDist.textContent = best.matchResult ? best.matchResult.distance.toFixed(3) : '—';
+  if (best.matchResult) {
+    const sim = best.matchResult.sim !== undefined ? best.matchResult.sim : (1 - best.matchResult.distance);
+    mDist.textContent = 'sim ' + sim.toFixed(3);
+  } else {
+    mDist.textContent = '—';
+  }
   mAge.textContent = det ? `${Math.round(det.age)}` : '—';
   mGender.textContent = det ? det.gender : '—';
 }
