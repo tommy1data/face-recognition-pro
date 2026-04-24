@@ -1159,57 +1159,11 @@ async function loadModels() {
   await faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL);
   stepDone('step-exp');
 
-  // Load ArcFace ONNX model
-  stepActive('step-arc');
-  try {
-    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
-    arcSession = await ort.InferenceSession.create(
-      'https://huggingface.co/garavv/arcface-onnx/resolve/main/arc.onnx',
-      { executionProviders: ['wasm'] }
-    );
-    arcReady = true;
-  } catch(e) {
-    console.warn('ArcFace ONNX load failed, falling back to face-api:', e);
-    arcReady = false;
-  }
-  stepDone('step-arc');
-
-  // Load MediaPipe FaceLandmarker
-  stepActive('step-mp');
-  try {
-    let attempts = 0;
-    while (!window._FilesetResolver && attempts++ < 20) {
-      await new Promise(r => setTimeout(r, 200));
-    }
-    if (window._FilesetResolver) {
-      const filesetResolver = await window._FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
-      );
-      mpLandmarker = await window._MPFaceLandmarker.createFromOptions(filesetResolver, {
-        baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-          delegate: 'GPU'
-        },
-        outputFaceBlendshapes: true,
-        runningMode: 'VIDEO',
-        numFaces: 4
-      });
-      mpReady = true;
-    }
-  } catch(e) {
-    console.warn('MediaPipe FaceLandmarker failed:', e);
-    mpReady = false;
-  }
-  stepDone('step-mp');
-
   stepActive('step-done');
   modelsLoaded = true;
   stepDone('step-done');
 
-  // Update engine badge
-  updateEngineIndicator();
-
-  // Hide overlay
+  // Hide overlay immediately — ArcFace + MediaPipe load in background
   const overlay = document.getElementById('loading-overlay');
   overlay.classList.add('hidden');
   setTimeout(() => overlay.remove(), 500);
@@ -1217,6 +1171,80 @@ async function loadModels() {
   setStatus('ready', 'Ready');
   document.getElementById('cam-hint').innerHTML = 'Models loaded — <span>click Start Camera</span>';
   document.getElementById('start-btn').disabled = false;
+
+  // Load ArcFace + MediaPipe in background (non-blocking)
+  loadArcFaceBackground();
+  loadMediaPipeBackground();
+}
+
+// ── Background loader: ArcFace ONNX ───────────────────────
+async function loadArcFaceBackground() {
+  stepActive('step-arc');
+  try {
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 30000));
+    arcSession = await Promise.race([
+      ort.InferenceSession.create(
+        'https://huggingface.co/garavv/arcface-onnx/resolve/main/arc.onnx',
+        { executionProviders: ['wasm'] }
+      ),
+      timeout
+    ]);
+    arcReady = true;
+    stepDone('step-arc');
+    toast('ArcFace engine ready', 'success', 2000);
+    updateEngineIndicator();
+  } catch(e) {
+    console.warn('ArcFace ONNX load failed, using face-api fallback:', e);
+    arcReady = false;
+    stepDone('step-arc');
+    updateEngineIndicator();
+  }
+}
+
+// ── Background loader: MediaPipe ──────────────────────────
+async function loadMediaPipeBackground() {
+  stepActive('step-mp');
+  try {
+    let attempts = 0;
+    while (!window._FilesetResolver && attempts++ < 20) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (window._FilesetResolver) {
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 30000));
+      const filesetResolver = await window._FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
+      );
+      mpLandmarker = await Promise.race([
+        window._MPFaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU'
+          },
+          outputFaceBlendshapes: true,
+          runningMode: 'VIDEO',
+          numFaces: 4
+        }),
+        timeout
+      ]);
+      mpReady = true;
+      stepDone('step-mp');
+      toast('MediaPipe liveness ready', 'success', 2000);
+      updateEngineIndicator();
+    } else {
+      throw new Error('MediaPipe module not available');
+    }
+  } catch(e) {
+    console.warn('MediaPipe FaceLandmarker failed, using eye-ratio fallback:', e);
+    mpReady = false;
+    stepDone('step-mp');
+    updateEngineIndicator();
+  }
+}
+
+// ── Dummy continuation (replaced above) ──────────────────
+function _loadModelsDone() {
+
 }
 
 // ── Status pill ───────────────────────────────────────────
